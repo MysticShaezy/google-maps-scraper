@@ -6,9 +6,10 @@ Supports multiple providers: Hunter.io, Clearbit, and web scraping fallback
 import asyncio
 import re
 import os
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Set
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
+from collections import deque
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -23,6 +24,151 @@ class EnrichmentResult:
     type: Optional[str] = None  # 'personal', 'generic', etc.
     position: Optional[str] = None
     verified: bool = False
+    page_url: Optional[str] = None  # Track which page the email was found on
+
+
+class WebsiteCrawler:
+    """Crawl website to find email addresses across all pages"""
+    
+    def __init__(self, session: aiohttp.ClientSession, max_pages: int = 20):
+        self.session = session
+        self.max_pages = max_pages
+        self.visited: Set[str] = set()
+        self.emails_found: Dict[str, EnrichmentResult] = {}
+    
+    async def crawl(self, start_url: str) -> List[EnrichmentResult]:
+        """Crawl website starting from URL and find all emails"""
+        if not start_url.startswith('http'):
+            start_url = f"https://{start_url}"
+        
+        # Normalize domain
+        parsed = urlparse(start_url)
+        base_domain = parsed.netloc.replace('www.', '')
+        
+        # Queue for BFS crawling
+        queue = deque([start_url])
+        priority_urls = [
+            f"{parsed.scheme}://{parsed.netloc}/contact",
+            f"{parsed.scheme}://{parsed.netloc}/contact-us",
+            f"{parsed.scheme}://{parsed.netloc}/about",
+            f"{parsed.scheme}://{parsed.netloc}/team",
+            f"{parsed.scheme}://{parsed.netloc}/staff"
+        ]
+        
+        # Add priority URLs to front of queue
+        for url in priority_urls:
+            queue.appendleft(url)
+        
+        while queue and len(self.visited) < self.max_pages:
+            url = queue.popleft()
+            
+            if url in self.visited:
+                continue
+            
+            self.visited.add(url)
+            
+            try:
+                async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                    if response.status == 200:
+                        content_type = response.headers.get('content-type', '').lower()
+                        if 'text/html' not in content_type:
+                            continue
+                        
+                        html = await response.text()
+                        await self._process_page(url, html, base_domain, queue)
+                        
+            except Exception as e:
+                print(f"Error crawling {url}: {e}")
+                continue
+        
+        return list(self.emails_found.values())
+    
+    async def _process_page(self, url: str, html: str, base_domain: str, queue: deque):
+        """Process a single page - extract emails and find links"""
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # Extract emails from this page
+        emails = self._extract_emails_from_text(html)
+        
+        for email in emails:
+            email_lower = email.lower()
+            if email_lower not in self.emails_found:
+                # Determine confidence based on email type and page
+                confidence = self._calculate_confidence(email, url)
+                
+                self.emails_found[email_lower] = EnrichmentResult(
+                    email=email,
+                    source='website-crawl',
+                    confidence=confidence,
+                    page_url=url
+                )
+        
+        # Find more links to crawl (only same domain)
+        if len(self.visited) < self.max_pages:
+            for link in soup.find_all('a', href=True):
+                href = link['href']
+                full_url = urljoin(url, href)
+                parsed_link = urlparse(full_url)
+                
+                # Only follow links on same domain
+                if parsed_link.netloc.replace('www.', '') == base_domain:
+                    # Skip common non-content URLs
+                    if not any(x in full_url.lower() for x in ['.pdf', '.jpg', '.png', '.gif', '.css', '.js', '?', '#', 'tel:', 'mailto:', 'javascript:']):
+                        if full_url not in self.visited:
+                            queue.append(full_url)
+    
+    def _extract_emails_from_text(self, text: str) -> List[str]:
+        """Extract email addresses from text with improved pattern"""
+        # Pattern to match email addresses - handles common obfuscations
+        patterns = [
+            r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
+            r'[A-Za-z0-9._%+-]+\s*@\s*[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}',  # with spaces
+            r'[A-Za-z0-9._%+-]+\[at\][A-Za-z0-9.-]+\.[A-Z|a-z]{2,}',  # [at] obfuscation
+            r'[A-Za-z0-9._%+-]+\(at\)[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}',  # (at) obfuscation
+        ]
+        
+        emails = []
+        for pattern in patterns:
+            matches = re.findall(pattern, text)
+            emails.extend(matches)
+        
+        # Clean up obfuscated emails
+        cleaned = []
+        for email in emails:
+            email = email.replace('[at]', '@').replace('(at)', '@').replace(' ', '').strip()
+            if re.match(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', email):
+                cleaned.append(email)
+        
+        # Filter out common false positives
+        filtered = []
+        for email in cleaned:
+            email_lower = email.lower()
+            if not any(x in email_lower for x in ['example.', 'test.', 'email@', 'user@', 'name@', 'yourname@', 'firstname@']):
+                filtered.append(email)
+        
+        return list(set(filtered))
+    
+    def _calculate_confidence(self, email: str, page_url: str) -> float:
+        """Calculate confidence score for an email found on a page"""
+        email_lower = email.lower()
+        url_lower = page_url.lower()
+        
+        base_confidence = 0.85
+        
+        # Boost for contact/about pages
+        if any(x in url_lower for x in ['contact', 'about', 'team', 'staff']):
+            base_confidence += 0.1
+        
+        # Reduce for generic emails
+        generic_patterns = ['info@', 'contact@', 'hello@', 'support@', 'admin@', 'sales@']
+        if any(pattern in email_lower for pattern in generic_patterns):
+            base_confidence -= 0.2
+        
+        # Boost for personal-looking emails (first.last patterns)
+        if re.match(r'^[a-z]+\.[a-z]+@', email_lower):
+            base_confidence += 0.05
+        
+        return min(base_confidence, 1.0)
 
 
 class EmailEnricher:
@@ -49,6 +195,18 @@ class EmailEnricher:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.session:
             await self.session.close()
+    
+    async def enrich_business_from_website(self, website: str, business_name: str = "") -> List[EnrichmentResult]:
+        """
+        Enrich a business by crawling their entire website for email addresses.
+        This is called sequentially after Google scraping completes.
+        """
+        if not website:
+            return []
+        
+        # Use the WebsiteCrawler for deep crawling
+        crawler = WebsiteCrawler(self.session, max_pages=15)
+        return await crawler.crawl(website)
     
     async def enrich_business(self, business) -> List[EnrichmentResult]:
         """
@@ -158,56 +316,9 @@ class EmailEnricher:
         return results
     
     async def _scrape_website(self, url: str) -> List[EnrichmentResult]:
-        """Scrape website for email addresses"""
-        results = []
-        
-        try:
-            if not url.startswith('http'):
-                url = f"https://{url}"
-            
-            # Try main page
-            async with self.session.get(url) as response:
-                if response.status == 200:
-                    html = await response.text()
-                    emails = self._extract_emails(html)
-                    
-                    for email in emails:
-                        source = 'website'
-                        confidence = 0.9
-                        
-                        # Lower confidence for generic emails
-                        if any(pattern in email.lower() for pattern in self.GENERIC_PATTERNS):
-                            confidence = 0.6
-                        
-                        results.append(EnrichmentResult(
-                            email=email,
-                            source=source,
-                            confidence=confidence
-                        ))
-            
-            # Try contact page
-            contact_urls = [f"{url}/contact", f"{url}/contact-us", f"{url}/about"]
-            for contact_url in contact_urls:
-                try:
-                    async with self.session.get(contact_url) as response:
-                        if response.status == 200:
-                            html = await response.text()
-                            emails = self._extract_emails(html)
-                            
-                            for email in emails:
-                                if not any(r.email == email for r in results):
-                                    results.append(EnrichmentResult(
-                                        email=email,
-                                        source='website-contact',
-                                        confidence=0.85
-                                    ))
-                except:
-                    continue
-        
-        except Exception as e:
-            print(f"Website scrape error for {url}: {e}")
-        
-        return results
+        """Scrape website using deep crawler to find emails across all pages"""
+        crawler = WebsiteCrawler(self.session, max_pages=15)
+        return await crawler.crawl(url)
     
     def _extract_emails(self, text: str) -> List[str]:
         """Extract email addresses from text"""

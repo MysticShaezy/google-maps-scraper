@@ -21,6 +21,8 @@ class StreamingCSVWriter:
         self.filepath = Path(filepath)
         self.fieldnames = fieldnames
         self.filepath.parent.mkdir(parents=True, exist_ok=True)
+        self._place_id_index: Dict[str, int] = {}  # Track row positions
+        self._rows: List[dict] = []  # Keep in-memory copy for updates
         
         # Create file with headers
         with open(self.filepath, 'w', newline='', encoding='utf-8') as f:
@@ -29,11 +31,29 @@ class StreamingCSVWriter:
     
     def append(self, business_dict: dict):
         """Append a single business to the CSV"""
+        self._rows.append(business_dict)
+        self._place_id_index[business_dict['place_id']] = len(self._rows) - 1
+        
         with open(self.filepath, 'a', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=self.fieldnames)
             # Only write fields that exist in our headers
             row = {k: v for k, v in business_dict.items() if k in self.fieldnames}
             writer.writerow(row)
+    
+    def update_row(self, business_dict: dict):
+        """Update an existing row with new data (e.g., enriched email)"""
+        place_id = business_dict.get('place_id')
+        if place_id and place_id in self._place_id_index:
+            # Update in-memory
+            idx = self._place_id_index[place_id]
+            self._rows[idx].update(business_dict)
+            
+            # Rewrite entire CSV
+            with open(self.filepath, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+                writer.writeheader()
+                for row in self._rows:
+                    writer.writerow({k: v for k, v in row.items() if k in self.fieldnames})
     
     def get_path(self) -> str:
         """Get the file path"""

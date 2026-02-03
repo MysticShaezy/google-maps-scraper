@@ -2,10 +2,29 @@
 Google Maps Scraper using Places API via HTTP requests
 """
 import os
+import time
+import math
 import requests
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 from dataclasses import dataclass
 from models import Business, Tile
+
+
+def haversine_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """
+    Calculate the great circle distance in kilometers between two points
+    on the earth (specified in decimal degrees)
+    """
+    # Convert decimal degrees to radians
+    lat1, lng1, lat2, lng2 = map(math.radians, [lat1, lng1, lat2, lng2])
+    
+    # Haversine formula
+    dlat = lat2 - lat1
+    dlng = lng2 - lng1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlng/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    r = 6371  # Radius of earth in kilometers
+    return c * r
 
 
 @dataclass
@@ -27,8 +46,21 @@ class GoogleMapsScraper:
         self.api_key = os.getenv('GOOGLE_MAPS_API_KEY')
         self.base_url = "https://maps.googleapis.com/maps/api/place"
     
-    async def search_tile(self, tile: Tile, query: str, job_id: str = None, socketio=None) -> List[Business]:
-        """Search businesses within a tile using Places API"""
+    async def search_tile(
+        self, 
+        tile: Tile, 
+        query: str, 
+        job_id: str = None, 
+        socketio = None,
+        center_lat: float = None,
+        center_lng: float = None,
+        max_radius_km: float = None,
+        api_radius_multiplier: float = 1.0
+    ) -> List[Business]:
+        """
+        Search businesses within a tile using Places API with pagination
+        Filters results to only include those within max_radius_km from center
+        """
         
         def log(msg, level='debug'):
             print(f"[Scraper] {msg}")
@@ -39,35 +71,82 @@ class GoogleMapsScraper:
                     pass
         
         businesses = []
-        center_lat, center_lng = tile.center
+        tile_center_lat, tile_center_lng = tile.center
         
-        log(f"Searching: {query} near {center_lat},{center_lng}", 'info')
+        # Use provided center or tile center
+        search_center_lat = center_lat if center_lat is not None else tile_center_lat
+        search_center_lng = center_lng if center_lng is not None else tile_center_lng
+        
+        # Calculate dynamic radius based on tile size with expansion multiplier
+        lat_span = tile.max_lat - tile.min_lat
+        lng_span = tile.max_lng - tile.min_lng
+        lat_km = lat_span * 111
+        lng_km = lng_span * 111 * math.cos(math.radians(tile_center_lat))
+        tile_diagonal_km = math.sqrt(lat_km**2 + lng_km**2)
+        base_radius = int(tile_diagonal_km * 1000 / 2)
+        search_radius = min(int(base_radius * api_radius_multiplier), 50000)  # Max 50km
+        
+        log(f"Searching: {query} near {tile_center_lat:.4f},{tile_center_lng:.4f} (API radius: {search_radius}m, multiplier: {api_radius_multiplier:.1f}x)", 'info')
         
         try:
-            # Use Places API Text Search
             url = f"{self.base_url}/textsearch/json"
-            params = {
-                'query': f"{query} near {center_lat},{center_lng}",
-                'location': f"{center_lat},{center_lng}",
-                'radius': 5000,
-                'key': self.api_key
-            }
+            all_places = []
+            next_page_token = None
+            page_count = 0
+            max_pages = 3
             
-            response = requests.get(url, params=params, timeout=10)
-            result = response.json()
+            while page_count < max_pages:
+                params = {
+                    'query': f"{query} near {tile_center_lat},{tile_center_lng}",
+                    'location': f"{tile_center_lat},{tile_center_lng}",
+                    'radius': search_radius,
+                    'key': self.api_key
+                }
+                
+                if next_page_token:
+                    params['pagetoken'] = next_page_token
+                    time.sleep(0.5)
+                
+                response = requests.get(url, params=params, timeout=10)
+                result = response.json()
+                
+                if result.get('status') != 'OK':
+                    if result.get('status') == 'INVALID_REQUEST' and next_page_token:
+                        log(f"Page token expired, continuing...", 'debug')
+                        break
+                    if page_count == 0:
+                        log(f"API error: {result.get('status')}", 'warning')
+                        return []
+                    break
+                
+                places = result.get('results', [])
+                all_places.extend(places)
+                log(f"Page {page_count + 1}: Found {len(places)} places (total: {len(all_places)})", 'info')
+                
+                next_page_token = result.get('next_page_token')
+                if not next_page_token:
+                    break
+                
+                page_count += 1
+                if page_count >= max_pages:
+                    break
             
-            if result.get('status') != 'OK':
-                log(f"API error: {result.get('status')}", 'warning')
-                return []
+            log(f"Total from API: {len(all_places)} places", 'info')
             
-            places = result.get('results', [])
-            log(f"Found {len(places)} places", 'info')
-            
-            for place in places:
+            # Filter and process results
+            filtered_count = 0
+            for place in all_places:
                 try:
                     location = place.get('geometry', {}).get('location', {})
-                    lat = location.get('lat', center_lat)
-                    lng = location.get('lng', center_lng)
+                    lat = location.get('lat', tile_center_lat)
+                    lng = location.get('lng', tile_center_lng)
+                    
+                    # Filter by distance from original center if specified
+                    if max_radius_km is not None and center_lat is not None and center_lng is not None:
+                        distance_km = haversine_distance(center_lat, center_lng, lat, lng)
+                        if distance_km > max_radius_km:
+                            filtered_count += 1
+                            continue  # Skip businesses outside desired radius
                     
                     types = place.get('types', [])
                     category = types[0].replace('_', ' ').title() if types else None
@@ -89,13 +168,14 @@ class GoogleMapsScraper:
                     if business.place_id not in self._place_cache:
                         self._place_cache[business.place_id] = business
                         businesses.append(business)
-                        log(f"✓ Added: {business.name}", 'success')
                         
                 except Exception as e:
-                    log(f"Error: {str(e)[:50]}", 'warning')
+                    log(f"Error processing place: {str(e)[:50]}", 'warning')
                     continue
             
-            log(f"Total: {len(businesses)} businesses", 'info')
+            if filtered_count > 0:
+                log(f"Filtered out {filtered_count} businesses outside {max_radius_km}km radius", 'debug')
+            log(f"Total unique within radius: {len(businesses)} businesses", 'info')
             
         except Exception as e:
             log(f"API Error: {str(e)[:80]}", 'error')

@@ -18,6 +18,7 @@ from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO, emit
 from flask_cors import CORS
 from dotenv import load_dotenv
+from supabase import create_client, Client
 
 from models import SearchConfig, Business, Tile
 from tile_grid import TileGrid, get_city_bounds
@@ -26,6 +27,17 @@ from email_enricher import EmailEnricher
 from storage import BusinessStore
 
 load_dotenv()
+
+# Initialize Supabase client
+supabase_url = os.getenv('SUPABASE_URL')
+supabase_key = os.getenv('SUPABASE_KEY')
+supabase: Client = None
+if supabase_url and supabase_key:
+    try:
+        supabase = create_client(supabase_url, supabase_key)
+        print("✓ Supabase connected")
+    except Exception as e:
+        print(f"✗ Supabase connection failed: {e}")
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-key')
@@ -293,6 +305,120 @@ def export_job(job_id, format):
     return jsonify({'error': 'Invalid format'}), 400
 
 
+@app.route('/api/documents', methods=['GET'])
+def get_saved_documents():
+    """Get all saved documents from Supabase"""
+    if not supabase:
+        return jsonify({'error': 'Supabase not configured'}), 500
+    
+    try:
+        response = supabase.table('saved_documents').select('*').order('created_at', desc=True).execute()
+        return jsonify({'documents': response.data})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/documents/<doc_id>', methods=['GET'])
+def get_document(doc_id):
+    """Get a specific saved document"""
+    if not supabase:
+        return jsonify({'error': 'Supabase not configured'}), 500
+    
+    try:
+        response = supabase.table('saved_documents').select('*').eq('id', doc_id).single().execute()
+        if response.data:
+            return jsonify(response.data)
+        return jsonify({'error': 'Document not found'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/documents/<doc_id>/download', methods=['GET'])
+def download_document(doc_id):
+    """Download a saved document as CSV"""
+    from flask import send_file
+    import io
+    
+    if not supabase:
+        return jsonify({'error': 'Supabase not configured'}), 500
+    
+    try:
+        response = supabase.table('saved_documents').select('*').eq('id', doc_id).single().execute()
+        if not response.data:
+            return jsonify({'error': 'Document not found'}), 404
+        
+        doc = response.data
+        csv_content = doc.get('csv_content', '')
+        
+        return send_file(
+            io.BytesIO(csv_content.encode()),
+            mimetype='text/csv',
+            as_attachment=True,
+            download_name=f"{doc['document_name']}_{doc_id}.csv"
+        )
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/documents/<doc_id>', methods=['DELETE'])
+def delete_document(doc_id):
+    """Delete a saved document"""
+    if not supabase:
+        return jsonify({'error': 'Supabase not configured'}), 500
+    
+    try:
+        supabase.table('saved_documents').delete().eq('id', doc_id).execute()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@socketio.on('save_document')
+def handle_save_document(data):
+    """Save job results as a named document to Supabase"""
+    job_id = data.get('job_id')
+    document_name = data.get('document_name', f'Scrape_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
+    
+    job = job_manager.get_job(job_id)
+    if not job or not job.businesses:
+        emit('document_saved', {'error': 'No results to save'})
+        return
+    
+    if not supabase:
+        emit('document_saved', {'error': 'Supabase not configured'})
+        return
+    
+    try:
+        # Read the CSV file content
+        csv_path = f"output/job_{job_id}/results.csv"
+        csv_content = ""
+        if os.path.exists(csv_path):
+            with open(csv_path, 'r', encoding='utf-8') as f:
+                csv_content = f.read()
+        
+        # Save to Supabase
+        doc_data = {
+            'job_id': job_id,
+            'document_name': document_name,
+            'query': job.query,
+            'city': data.get('city', ''),
+            'total_results': len(job.businesses),
+            'businesses': job.businesses,
+            'csv_content': csv_content
+        }
+        
+        response = supabase.table('saved_documents').insert(doc_data).execute()
+        
+        emit('document_saved', {
+            'success': True,
+            'document': response.data[0] if response.data else None,
+            'message': f'Document "{document_name}" saved with {len(job.businesses)} results'
+        })
+        
+    except Exception as e:
+        emit('document_saved', {'error': str(e)})
+
+
 @socketio.on('start_scrape')
 def handle_start_scrape(data):
     """Handle scrape start request"""
@@ -368,6 +494,14 @@ def run_scraper(job_id: str, query: str, city: str, custom_bounds: str,
     
     min_lat, max_lat, min_lng, max_lng = bounds
     
+    # Calculate center point and radius for distance filtering
+    center_lat = (min_lat + max_lat) / 2
+    center_lng = (min_lng + max_lng) / 2
+    # Calculate radius as distance from center to corner
+    lat_span_km = (max_lat - min_lat) * 111
+    lng_span_km = (max_lng - min_lng) * 111 * math.cos(math.radians(center_lat))
+    max_radius_km = math.sqrt(lat_span_km**2 + lng_span_km**2) / 2
+    
     # Update job
     job.status = 'running'
     job.started_at = datetime.now()
@@ -390,10 +524,10 @@ def run_scraper(job_id: str, query: str, city: str, custom_bounds: str,
     )
     
     tile_grid = TileGrid(tile_size=effective_tile_size)
-    tiles = tile_grid.create_grid(config, overlap=0.15)  # 15% overlap to prevent missing businesses
+    tiles = tile_grid.create_grid(config, overlap=0.25)  # 25% overlap for maximum coverage
     job.tiles_total = len(tiles)
     
-    socketio.emit('log_message', {'job_id': job_id, 'message': f'Search area: {area_degrees:.2f} sq degrees, Tile size: {effective_tile_size:.3f}°, Tiles: {len(tiles)}, Overlap: 15%', 'level': 'info'})
+    socketio.emit('log_message', {'job_id': job_id, 'message': f'Search area: {area_degrees:.2f} sq degrees, Tile size: {effective_tile_size:.3f}°, Tiles: {len(tiles)}, Overlap: 25%', 'level': 'info'})
     
     # Emit job started
     socketio.emit('job_started', job.to_dict())
@@ -406,7 +540,8 @@ def run_scraper(job_id: str, query: str, city: str, custom_bounds: str,
     try:
         # Run async scraper in this thread's event loop
         loop.run_until_complete(scrape_worker(
-            job_id, job, tiles, query, tile_grid, enrich_emails, headless, smart_mode
+            job_id, job, tiles, query, tile_grid, enrich_emails, headless, smart_mode,
+            search_center=(center_lat, center_lng), max_radius_km=max_radius_km
         ))
     except Exception as e:
         import traceback
@@ -423,8 +558,9 @@ def run_scraper(job_id: str, query: str, city: str, custom_bounds: str,
 
 
 async def scrape_worker(job_id: str, job: ScrapingJob, tiles: list, query: str,
-                       tile_grid: TileGrid, enrich_emails: bool, headless: bool, smart_mode: bool = False):
-    """Async worker for scraping with deduplication and smart search"""
+                       tile_grid: TileGrid, enrich_emails: bool, headless: bool, smart_mode: bool = False,
+                       search_center: Tuple[float, float] = None, max_radius_km: float = None):
+    """Async worker for scraping with deduplication, smart search, and radius expansion"""
     from storage import StreamingCSVWriter
     
     print(f"[Job {job_id}] Starting scrape_worker with {len(tiles)} tiles")
@@ -466,8 +602,21 @@ async def scrape_worker(job_id: str, job: ScrapingJob, tiles: list, query: str,
     
     socketio.emit('log_message', {'job_id': job_id, 'message': f'Will search with queries: {search_queries}', 'level': 'info'})
     
+    # Radius expansion settings
+    center_lat, center_lng = search_center if search_center else (None, None)
+    api_radius_multiplier = 1.0
+    max_expansion_multiplier = 3.0  # Max 3x the original search radius
+    expansion_increment = 0.5  # Increase by 50% each time
+    expansion_count = 0
+    max_expansions = 4  # Max 4 expansion attempts
+    
+    if max_radius_km:
+        socketio.emit('log_message', {'job_id': job_id, 'message': f'Radius filter: {max_radius_km}km from center, max expansion: {max_expansion_multiplier}x', 'level': 'info'})
+    
     empty_tile_count = 0
-    max_empty_tiles = 5
+    # Scale max_empty_tiles with search area - larger areas need higher threshold
+    max_empty_tiles = max(5, len(tiles) // 10)  # At least 5, or 10% of tiles
+    socketio.emit('log_message', {'job_id': job_id, 'message': f'Empty tile threshold: {max_empty_tiles} (based on {len(tiles)} tiles)', 'level': 'debug'})
     
     socketio.emit('log_message', {'job_id': job_id, 'message': 'Initializing browser...', 'level': 'info'})
     
@@ -475,8 +624,26 @@ async def scrape_worker(job_id: str, job: ScrapingJob, tiles: list, query: str,
         async with GoogleMapsScraper(scraping_config) as scraper:
             socketio.emit('log_message', {'job_id': job_id, 'message': 'Browser ready, starting tile search...', 'level': 'success'})
             
-            async with EmailEnricher() as enricher:
-                queries_to_try = search_queries if smart_mode else [query]
+            queries_to_try = search_queries if smart_mode else [query]
+            
+            # Main scraping loop with radius expansion
+            while expansion_count <= max_expansions:
+                if expansion_count > 0:
+                    socketio.emit('log_message', {
+                        'job_id': job_id, 
+                        'message': f'⚡ Radius expansion #{expansion_count}: {api_radius_multiplier:.1f}x API radius ({job.current_count}/{job.target_count} found)', 
+                        'level': 'warning'
+                    })
+                    # Reset tiles to search them again with larger radius
+                    tile_grid = TileGrid(tile_size=tiles[0].max_lat - tiles[0].min_lat if tiles else 0.05)
+                    config = SearchConfig(
+                        query=query,
+                        min_lat=min_lat, max_lat=max_lat,
+                        min_lng=min_lng, max_lng=max_lng,
+                        tile_size=tiles[0].max_lat - tiles[0].min_lat if tiles else 0.05
+                    )
+                    tiles = tile_grid.create_grid(config, overlap=0.25)
+                    empty_tile_count = 0
                 
                 for i, tile in enumerate(tiles):
                     if job_manager.should_stop(job_id):
@@ -495,28 +662,15 @@ async def scrape_worker(job_id: str, job: ScrapingJob, tiles: list, query: str,
                     
                     for search_query in queries_to_try:
                         try:
-                            socketio.emit('log_message', {'job_id': job_id, 'message': f'  Query: "{search_query}"', 'level': 'debug'})
-                            businesses = await scraper.search_tile(tile, search_query, job_id=job_id, socketio=socketio)
-                            
+                            socketio.emit('log_message', {'job_id': job_id, 'message': f'  Query: "{search_query}" (expansion: {api_radius_multiplier:.1f}x)', 'level': 'debug'})
+                            businesses = await scraper.search_tile(
+                                tile, search_query, job_id=job_id, socketio=socketio,
+                                center_lat=center_lat, center_lng=center_lng,
+                                max_radius_km=max_radius_km, api_radius_multiplier=api_radius_multiplier
+                            )
                             if businesses:
                                 socketio.emit('log_message', {'job_id': job_id, 'message': f'  Found {len(businesses)} businesses', 'level': 'info'})
                                 tile_found_businesses = True
-                                
-                                if enrich_emails:
-                                    for business in businesses:
-                                        if business.website and not business.email:
-                                            try:
-                                                results = await enricher.enrich_business(business)
-                                                if results:
-                                                    best_email = enricher.get_best_email(results)
-                                                    business.email = best_email
-                                                    business.emails = [r.email for r in results]
-                                                    socketio.emit('log_message', {'job_id': job_id, 'message': f'    Enriched email for {business.name}', 'level': 'debug'})
-                                            except Exception as e:
-                                                print(f"Email enrichment error: {e}")
-                                        
-                                        if job.current_count >= job.target_count:
-                                            break
                                 
                                 for business in businesses:
                                     if job.current_count >= job.target_count:
@@ -577,6 +731,11 @@ async def scrape_worker(job_id: str, job: ScrapingJob, tiles: list, query: str,
                         empty_tile_count += 1
                         socketio.emit('log_message', {'job_id': job_id, 'message': f'Empty tile ({empty_tile_count}/{max_empty_tiles})', 'level': 'warning'})
                         if empty_tile_count >= max_empty_tiles:
+                            # Check if we should expand radius
+                            if job.current_count < job.target_count and api_radius_multiplier < max_expansion_multiplier:
+                                socketio.emit('log_message', {'job_id': job_id, 'message': f'Target not met ({job.current_count}/{job.target_count}), expanding search radius...', 'level': 'warning'})
+                                break  # Break tile loop to trigger expansion
+                            # Otherwise complete the job
                             job.status = 'completed'
                             job.completed_at = datetime.now()
                             socketio.emit('job_completed', {
@@ -595,6 +754,22 @@ async def scrape_worker(job_id: str, job: ScrapingJob, tiles: list, query: str,
                     tile_grid.mark_tile_searched(tile.id, job.current_count)
                     job.tiles_completed += 1
                     socketio.emit('progress_update', job.to_dict())
+                
+                # Check if target met or max expansion reached
+                if job.current_count >= job.target_count:
+                    break
+                
+                if api_radius_multiplier >= max_expansion_multiplier or expansion_count >= max_expansions:
+                    socketio.emit('log_message', {'job_id': job_id, 'message': f'Max radius expansion reached ({api_radius_multiplier:.1f}x). Found {job.current_count}/{job.target_count} businesses.', 'level': 'warning'})
+                    break
+                
+                # Expand radius for next iteration
+                api_radius_multiplier += expansion_increment
+                expansion_count += 1
+                
+                # Save current state before expansion
+                socketio.emit('log_message', {'job_id': job_id, 'message': f'Expanding search: {job.current_count}/{job.target_count} found. Increasing API radius to {api_radius_multiplier:.1f}x...', 'level': 'info'})
+                
     except Exception as e:
         import traceback
         print(f"[Job {job_id}] Scraper error: {e}")
@@ -607,11 +782,74 @@ async def scrape_worker(job_id: str, job: ScrapingJob, tiles: list, query: str,
     
     job.status = 'completed'
     job.completed_at = datetime.now()
+    
+    # Phase 2: Email enrichment - crawl each website individually after scraping
+    enriched_count = 0
+    if enrich_emails and job.businesses:
+        socketio.emit('log_message', {'job_id': job_id, 'message': f'Starting email enrichment for {len(job.businesses)} businesses...', 'level': 'info'})
+        socketio.emit('email_enrichment_started', {'job_id': job_id, 'total': len(job.businesses)})
+        
+        async with EmailEnricher() as enricher:
+            for idx, biz_dict in enumerate(job.businesses):
+                if job_manager.should_stop(job_id):
+                    break
+                
+                website = biz_dict.get('website')
+                if website and not biz_dict.get('email'):
+                    try:
+                        socketio.emit('log_message', {'job_id': job_id, 'message': f'[{idx+1}/{len(job.businesses)}] Crawling {website}...', 'level': 'debug'})
+                        results = await enricher.enrich_business_from_website(website, biz_dict.get('name', ''))
+                        
+                        if results:
+                            best_email = enricher.get_best_email(results)
+                            biz_dict['email'] = best_email
+                            biz_dict['emails'] = [r.email for r in results]
+                            enriched_count += 1
+                            socketio.emit('log_message', {'job_id': job_id, 'message': f'  ✓ Found email: {best_email}', 'level': 'success'})
+                            
+                            # Update CSV with enriched email
+                            csv_writer.update_row(biz_dict)
+                            
+                            # Emit update to frontend
+                            socketio.emit('business_updated', {
+                                'job_id': job_id,
+                                'place_id': biz_dict['place_id'],
+                                'email': best_email,
+                                'emails': biz_dict['emails'],
+                                'progress': {'current': idx+1, 'total': len(job.businesses), 'enriched': enriched_count}
+                            })
+                        else:
+                            socketio.emit('log_message', {'job_id': job_id, 'message': f'  No emails found', 'level': 'debug'})
+                        
+                        # Small delay to be nice to websites
+                        await asyncio.sleep(0.5)
+                        
+                    except Exception as e:
+                        socketio.emit('log_message', {'job_id': job_id, 'message': f'  Error: {str(e)[:50]}', 'level': 'error'})
+                
+                socketio.emit('email_enrichment_progress', {
+                    'job_id': job_id,
+                    'current': idx+1,
+                    'total': len(job.businesses),
+                    'enriched': enriched_count
+                })
+        
+        socketio.emit('email_enrichment_completed', {
+            'job_id': job_id,
+            'enriched': enriched_count,
+            'total': len(job.businesses)
+        })
+        socketio.emit('log_message', {'job_id': job_id, 'message': f'Email enrichment complete: {enriched_count}/{len(job.businesses)} businesses enriched', 'level': 'success'})
+    
     socketio.emit('job_completed', {
         **job.to_dict(),
         'deduplication_stats': {
             'unique_businesses': len(seen_place_ids),
             'search_variations_used': len(queries_to_try) if smart_mode else 1
+        },
+        'email_enrichment': {
+            'enriched': enriched_count,
+            'total': len(job.businesses)
         }
     })
     socketio.emit('log_message', {'job_id': job_id, 'message': f'Completed! Found {len(seen_place_ids)} unique businesses', 'level': 'success'})
