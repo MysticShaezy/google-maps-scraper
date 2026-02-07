@@ -202,6 +202,7 @@
                     <div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
                         <span>Live Results (<span id="resultCount">0</span>)</span>
                         <div id="exportButtons" style="display:none">
+                            <button onclick="forceEmailEnrichment()" style="padding:6px 12px;margin-right:8px;background:#ff9800;color:white;border:none;border-radius:4px;cursor:pointer" id="forceEmailBtn">Find Emails</button>
                             <button onclick="exportResults('json')" style="padding:6px 12px;margin-right:8px;background:#667eea;color:white;border:none;border-radius:4px;cursor:pointer">JSON</button>
                             <button onclick="exportResults('csv')" style="padding:6px 12px;background:#667eea;color:white;border:none;border-radius:4px;cursor:pointer">CSV</button>
                         </div>
@@ -381,6 +382,26 @@
                 document.getElementById('emailProgressBar').textContent='100%';
                 document.getElementById('currentEmailWebsite').textContent='Complete! Found '+data.enriched+' emails';
                 updateStatus('completed');
+                document.getElementById('forceEmailBtn').disabled=false;
+                document.getElementById('forceEmailBtn').textContent='Find Emails';
+            });
+            
+            socket.on('email_enrichment_manual_started',data=>{
+                document.getElementById('emailEnrichmentSection').style.display='block';
+                updateStatus('enriching');
+                addLog(data.message,'info');
+            });
+            
+            socket.on('email_enrichment_manual_complete',data=>{
+                addLog(data.message,'success');
+                document.getElementById('forceEmailBtn').disabled=false;
+                document.getElementById('forceEmailBtn').textContent='Find Emails';
+            });
+            
+            socket.on('email_enrichment_error',data=>{
+                addLog('Email enrichment error: '+data.error,'error');
+                document.getElementById('forceEmailBtn').disabled=false;
+                document.getElementById('forceEmailBtn').textContent='Find Emails';
             });
             
             // Load saved documents on startup
@@ -430,6 +451,15 @@
         function addBusiness(b){businesses.push(b);const container=document.getElementById('resultsContainer');if(businesses.length===1){container.innerHTML='<table id="resultsTable" style="width:100%;border-collapse:collapse;font-size:14px"><thead style="background:#f3f4f6;position:sticky;top:0"><tr><th style="padding:10px;text-align:left;border-bottom:2px solid #ddd">Name</th><th style="padding:10px;text-align:left;border-bottom:2px solid #ddd">Address</th><th style="padding:10px;text-align:left;border-bottom:2px solid #ddd">Phone</th><th style="padding:10px;text-align:left;border-bottom:2px solid #ddd">Website</th><th style="padding:10px;text-align:left;border-bottom:2px solid #ddd">Email</th><th style="padding:10px;text-align:left;border-bottom:2px solid #ddd">Rating</th></tr></thead><tbody id="resultsTableBody"></tbody></table>'}const row=document.createElement('tr');row.style.borderBottom='1px solid #eee';row.innerHTML='<td style="padding:8px">'+escapeHtml(b.name)+'</td><td style="padding:8px">'+escapeHtml(b.address||'')+'</td><td style="padding:8px">'+escapeHtml(b.phone||'')+'</td><td style="padding:8px">'+(b.website?'<a href="'+b.website+'" target="_blank">'+escapeHtml(b.website.substring(0,30))+'</a>':'')+'</td><td style="padding:8px">'+(b.email?'<span style="color:green;font-weight:600">'+escapeHtml(b.email)+'</span>':'')+'</td><td style="padding:8px">'+(b.rating?b.rating+' ⭐':'')+'</td>';document.getElementById('resultsTableBody').appendChild(row);}
 
         function exportResults(fmt){if(!currentJobId)return;addLog('Exporting as '+fmt.toUpperCase()+'...','info');fetch('/api/jobs/'+currentJobId+'/export/'+fmt).then(r=>{if(r.ok&&fmt==='csv'){return r.blob().then(blob=>{const url=window.URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=currentJobId+'_results.csv';document.body.appendChild(a);a.click();document.body.removeChild(a);addLog('CSV downloaded!','success');})}else if(r.ok){return r.json().then(d=>{addLog('Export complete!','success');alert(d.message);})}else{return r.json().then(d=>{addLog('Export failed: '+d.error,'error');})}}).catch(e=>addLog('Export error: '+e,'error'));}
+
+        function forceEmailEnrichment(){
+            if(!currentJobId){alert('No active job. Please run a scrape first.');return;}
+            if(businesses.length===0){alert('No businesses to enrich. Please wait for scraping to complete.');return;}
+            addLog('Manually triggering email enrichment...','info');
+            document.getElementById('forceEmailBtn').disabled=true;
+            document.getElementById('forceEmailBtn').textContent='Finding...';
+            socket.emit('force_email_enrichment',{job_id:currentJobId});
+        }
 
         function saveDocument(){
             if(!currentJobId)return;

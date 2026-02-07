@@ -464,6 +464,59 @@ def handle_stop_scrape(data):
         emit('job_stopped', {'job_id': job_id, 'results_count': len(job.businesses)})
 
 
+@socketio.on('force_email_enrichment')
+def handle_force_email_enrichment(data):
+    """Handle manual request to run email enrichment on existing results"""
+    job_id = data.get('job_id')
+    job = job_manager.get_job(job_id)
+    
+    if not job:
+        emit('email_enrichment_error', {'job_id': job_id, 'error': 'Job not found'})
+        return
+    
+    if not job.businesses:
+        emit('email_enrichment_error', {'job_id': job_id, 'error': 'No businesses to enrich'})
+        return
+    
+    # Create CSV writer for this job
+    output_dir = f"output/job_{job_id}"
+    from storage import StreamingCSVWriter
+    csv_writer = StreamingCSVWriter(
+        filepath=f"{output_dir}/results.csv",
+        fieldnames=['place_id', 'name', 'address', 'phone', 'website', 'email', 'category', 'rating', 'review_count', 'latitude', 'longitude', 'scraped_at']
+    )
+    
+    # Run enrichment in background thread
+    def run_enrichment():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            # Create a set of seen place_ids (for compatibility)
+            seen_place_ids = set(b['place_id'] for b in job.businesses)
+            loop.run_until_complete(run_email_enrichment(
+                job_id=job_id,
+                job=job,
+                csv_writer=csv_writer,
+                seen_place_ids=seen_place_ids,
+                smart_mode=False,
+                force=True  # Force update even if email exists
+            ))
+            emit('email_enrichment_manual_complete', {'job_id': job_id, 'message': 'Email enrichment complete!'})
+        except Exception as e:
+            import traceback
+            print(f"[Job {job_id}] Email enrichment error: {e}")
+            print(traceback.format_exc())
+            emit('email_enrichment_error', {'job_id': job_id, 'error': str(e)})
+        finally:
+            loop.close()
+    
+    thread = threading.Thread(target=run_enrichment)
+    thread.daemon = True
+    thread.start()
+    
+    emit('email_enrichment_manual_started', {'job_id': job_id, 'message': f'Starting email enrichment for {len(job.businesses)} businesses...'})
+
+
 def run_scraper(job_id: str, query: str, city: str, custom_bounds: str, 
                 tile_size: float, enrich_emails: bool, headless: bool, smart_mode: bool = False):
     """Run the scraper in a separate thread with proper SocketIO context"""
@@ -557,6 +610,76 @@ def run_scraper(job_id: str, query: str, city: str, custom_bounds: str,
         loop.close()
 
 
+async def run_email_enrichment(job_id: str, job: ScrapingJob, csv_writer, seen_place_ids: set, smart_mode: bool = False, force: bool = False):
+    """Run email enrichment on all businesses in a job. Can be called during scraping or manually."""
+    from email_enricher import EmailEnricher
+    
+    enriched_count = 0
+    if not job.businesses:
+        socketio.emit('log_message', {'job_id': job_id, 'message': 'No businesses to enrich', 'level': 'warning'})
+        return 0
+    
+    socketio.emit('log_message', {'job_id': job_id, 'message': f'Starting email enrichment for {len(job.businesses)} businesses...', 'level': 'info'})
+    socketio.emit('email_enrichment_started', {'job_id': job_id, 'total': len(job.businesses)})
+    
+    async with EmailEnricher() as enricher:
+        for idx, biz_dict in enumerate(job.businesses):
+            if job_manager.should_stop(job_id):
+                break
+            
+            website = biz_dict.get('website')
+            if website:
+                try:
+                    socketio.emit('log_message', {'job_id': job_id, 'message': f'[{idx+1}/{len(job.businesses)}] Crawling {website}...', 'level': 'debug'})
+                    results = await enricher.enrich_business_from_website(website, biz_dict.get('name', ''))
+                    
+                    if results:
+                        best_email = enricher.get_best_email(results)
+                        # Update if we found a better email or if forcing (always update)
+                        should_update = force or not biz_dict.get('email') or (best_email and len(best_email) > len(biz_dict.get('email', '')))
+                        if best_email and should_update:
+                            biz_dict['email'] = best_email
+                            biz_dict['emails'] = [r.email for r in results]
+                            enriched_count += 1
+                            socketio.emit('log_message', {'job_id': job_id, 'message': f'  ✓ Found email: {best_email}', 'level': 'success'})
+                        
+                        # Update CSV with enriched email
+                        csv_writer.update_row(biz_dict)
+                        
+                        # Emit update to frontend
+                        socketio.emit('business_updated', {
+                            'job_id': job_id,
+                            'place_id': biz_dict['place_id'],
+                            'email': best_email,
+                            'emails': biz_dict.get('emails', []),
+                            'progress': {'current': idx+1, 'total': len(job.businesses), 'enriched': enriched_count}
+                        })
+                    else:
+                        socketio.emit('log_message', {'job_id': job_id, 'message': f'  No emails found', 'level': 'debug'})
+                    
+                    # Small delay to be nice to websites
+                    await asyncio.sleep(0.5)
+                    
+                except Exception as e:
+                    socketio.emit('log_message', {'job_id': job_id, 'message': f'  Error: {str(e)[:50]}', 'level': 'error'})
+            
+            socketio.emit('email_enrichment_progress', {
+                'job_id': job_id,
+                'current': idx+1,
+                'total': len(job.businesses),
+                'enriched': enriched_count
+            })
+    
+    socketio.emit('email_enrichment_completed', {
+        'job_id': job_id,
+        'enriched': enriched_count,
+        'total': len(job.businesses)
+    })
+    socketio.emit('log_message', {'job_id': job_id, 'message': f'Email enrichment complete: {enriched_count}/{len(job.businesses)} businesses enriched', 'level': 'success'})
+    
+    return enriched_count
+
+
 async def scrape_worker(job_id: str, job: ScrapingJob, tiles: list, query: str,
                        tile_grid: TileGrid, enrich_emails: bool, headless: bool, smart_mode: bool = False,
                        search_center: Tuple[float, float] = None, max_radius_km: float = None):
@@ -634,16 +757,12 @@ async def scrape_worker(job_id: str, job: ScrapingJob, tiles: list, query: str,
                         'message': f'⚡ Radius expansion #{expansion_count}: {api_radius_multiplier:.1f}x API radius ({job.current_count}/{job.target_count} found)', 
                         'level': 'warning'
                     })
-                    # Reset tiles to search them again with larger radius
-                    tile_grid = TileGrid(tile_size=tiles[0].max_lat - tiles[0].min_lat if tiles else 0.05)
-                    config = SearchConfig(
-                        query=query,
-                        min_lat=min_lat, max_lat=max_lat,
-                        min_lng=min_lng, max_lng=max_lng,
-                        tile_size=tiles[0].max_lat - tiles[0].min_lat if tiles else 0.05
-                    )
-                    tiles = tile_grid.create_grid(config, overlap=0.25)
+                    # Reset all tiles to unsearched so we can search them again with larger radius
+                    for tile in tiles:
+                        tile.searched = False
+                        tile.business_count = 0
                     empty_tile_count = 0
+                    job.tiles_completed = 0
                 
                 for i, tile in enumerate(tiles):
                     if job_manager.should_stop(job_id):
@@ -735,19 +854,9 @@ async def scrape_worker(job_id: str, job: ScrapingJob, tiles: list, query: str,
                             if job.current_count < job.target_count and api_radius_multiplier < max_expansion_multiplier:
                                 socketio.emit('log_message', {'job_id': job_id, 'message': f'Target not met ({job.current_count}/{job.target_count}), expanding search radius...', 'level': 'warning'})
                                 break  # Break tile loop to trigger expansion
-                            # Otherwise complete the job
-                            job.status = 'completed'
-                            job.completed_at = datetime.now()
-                            socketio.emit('job_completed', {
-                                **job.to_dict(),
-                                'message': f'No more businesses found. Checked {len(queries_to_try)} search variations.',
-                                'deduplication_stats': {
-                                    'unique_businesses': len(seen_place_ids),
-                                    'search_variations_used': len(queries_to_try)
-                                }
-                            })
+                            # Otherwise stop searching but continue to email enrichment
                             socketio.emit('log_message', {'job_id': job_id, 'message': 'Auto-stopped: No more businesses in area', 'level': 'warning'})
-                            return
+                            break
                     else:
                         empty_tile_count = 0
                     
@@ -786,60 +895,14 @@ async def scrape_worker(job_id: str, job: ScrapingJob, tiles: list, query: str,
     # Phase 2: Email enrichment - crawl each website individually after scraping
     enriched_count = 0
     if enrich_emails and job.businesses:
-        socketio.emit('log_message', {'job_id': job_id, 'message': f'Starting email enrichment for {len(job.businesses)} businesses...', 'level': 'info'})
-        socketio.emit('email_enrichment_started', {'job_id': job_id, 'total': len(job.businesses)})
-        
-        async with EmailEnricher() as enricher:
-            for idx, biz_dict in enumerate(job.businesses):
-                if job_manager.should_stop(job_id):
-                    break
-                
-                website = biz_dict.get('website')
-                if website and not biz_dict.get('email'):
-                    try:
-                        socketio.emit('log_message', {'job_id': job_id, 'message': f'[{idx+1}/{len(job.businesses)}] Crawling {website}...', 'level': 'debug'})
-                        results = await enricher.enrich_business_from_website(website, biz_dict.get('name', ''))
-                        
-                        if results:
-                            best_email = enricher.get_best_email(results)
-                            biz_dict['email'] = best_email
-                            biz_dict['emails'] = [r.email for r in results]
-                            enriched_count += 1
-                            socketio.emit('log_message', {'job_id': job_id, 'message': f'  ✓ Found email: {best_email}', 'level': 'success'})
-                            
-                            # Update CSV with enriched email
-                            csv_writer.update_row(biz_dict)
-                            
-                            # Emit update to frontend
-                            socketio.emit('business_updated', {
-                                'job_id': job_id,
-                                'place_id': biz_dict['place_id'],
-                                'email': best_email,
-                                'emails': biz_dict['emails'],
-                                'progress': {'current': idx+1, 'total': len(job.businesses), 'enriched': enriched_count}
-                            })
-                        else:
-                            socketio.emit('log_message', {'job_id': job_id, 'message': f'  No emails found', 'level': 'debug'})
-                        
-                        # Small delay to be nice to websites
-                        await asyncio.sleep(0.5)
-                        
-                    except Exception as e:
-                        socketio.emit('log_message', {'job_id': job_id, 'message': f'  Error: {str(e)[:50]}', 'level': 'error'})
-                
-                socketio.emit('email_enrichment_progress', {
-                    'job_id': job_id,
-                    'current': idx+1,
-                    'total': len(job.businesses),
-                    'enriched': enriched_count
-                })
-        
-        socketio.emit('email_enrichment_completed', {
-            'job_id': job_id,
-            'enriched': enriched_count,
-            'total': len(job.businesses)
-        })
-        socketio.emit('log_message', {'job_id': job_id, 'message': f'Email enrichment complete: {enriched_count}/{len(job.businesses)} businesses enriched', 'level': 'success'})
+        enriched_count = await run_email_enrichment(
+            job_id=job_id,
+            job=job,
+            csv_writer=csv_writer,
+            seen_place_ids=seen_place_ids,
+            smart_mode=smart_mode,
+            force=False
+        )
     
     socketio.emit('job_completed', {
         **job.to_dict(),

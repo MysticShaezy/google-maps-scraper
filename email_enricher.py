@@ -143,8 +143,33 @@ class WebsiteCrawler:
         filtered = []
         for email in cleaned:
             email_lower = email.lower()
-            if not any(x in email_lower for x in ['example.', 'test.', 'email@', 'user@', 'name@', 'yourname@', 'firstname@']):
-                filtered.append(email)
+            local_part = email_lower.split('@')[0] if '@' in email_lower else ''
+            domain_part = email_lower.split('@')[1] if '@' in email_lower else ''
+            
+            # Skip if contains these patterns
+            skip_patterns = [
+                'example.', 'test.', 'email@', 'user@', 'name@', 'yourname@', 'firstname@',
+                'sentry', 'sentry-next', 'noreply', 'no-reply', 'donotreply', 'do-not-reply',
+                'reply@', 'bounces@', 'bounce@', 'notification@', 'notifications@',
+                '.jpg', '.jpeg', '.png', '.gif', '.pdf', '.css', '.js', '.svg',
+            ]
+            
+            if any(x in email_lower for x in skip_patterns):
+                continue
+            
+            # Skip if local part is too long (likely a hash/UUID, not a real email)
+            if len(local_part) > 30:
+                continue
+            
+            # Skip if looks like a hex hash (32+ chars with only hex digits and maybe dashes/underscores)
+            if len(local_part) >= 32 and all(c in '0123456789abcdef-_' for c in local_part):
+                continue
+            
+            # Skip if contains image file patterns after @
+            if any(ext in domain_part for ext in ['.jpg', '.jpeg', '.png', '.gif']):
+                continue
+            
+            filtered.append(email)
         
         return list(set(filtered))
     
@@ -330,8 +355,29 @@ class EmailEnricher:
         filtered = []
         for email in emails:
             email_lower = email.lower()
-            if not any(x in email_lower for x in ['example.', 'test.', 'email@', 'user@']):
-                filtered.append(email)
+            local_part = email_lower.split('@')[0] if '@' in email_lower else ''
+            domain_part = email_lower.split('@')[1] if '@' in email_lower else ''
+            
+            skip_patterns = [
+                'example.', 'test.', 'email@', 'user@', 'name@', 'yourname@', 'firstname@',
+                'sentry', 'sentry-next', 'noreply', 'no-reply', 'donotreply', 'do-not-reply',
+                'reply@', 'bounces@', 'bounce@', 'notification@', 'notifications@',
+                '.jpg', '.jpeg', '.png', '.gif', '.pdf', '.css', '.js', '.svg',
+            ]
+            
+            if any(x in email_lower for x in skip_patterns):
+                continue
+            
+            if len(local_part) > 30:
+                continue
+            
+            if len(local_part) >= 32 and all(c in '0123456789abcdef-_' for c in local_part):
+                continue
+            
+            if any(ext in domain_part for ext in ['.jpg', '.jpeg', '.png', '.gif']):
+                continue
+            
+            filtered.append(email)
         
         return list(set(filtered))
     
