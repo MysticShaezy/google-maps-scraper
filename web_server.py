@@ -26,6 +26,7 @@ from tile_grid import TileGrid, get_city_bounds
 from scraper import GoogleMapsScraper, ScrapingConfig
 from email_enricher import EmailEnricher
 from storage import BusinessStore
+from api_cache import APIResponseCache
 
 load_dotenv()
 
@@ -136,8 +137,13 @@ def index():
 
 @app.route('/api/places/autocomplete')
 def places_autocomplete():
-    """Google Places API autocomplete for location search"""
+    """Google Places API autocomplete for location search.
+    Uses session tokens to group autocomplete keystrokes + subsequent
+    place details call into a single billing session ($2.83/session
+    instead of $2.83/keystroke).
+    """
     query = request.args.get('q', '')
+    session_token = request.args.get('session_token', '')
     api_key = os.getenv('GOOGLE_MAPS_API_KEY')
     
     if not api_key:
@@ -154,6 +160,11 @@ def places_autocomplete():
             'language': 'en',
             'components': 'country:au'  # Bias to Australia based on user location
         }
+        
+        # Session token groups all autocomplete keystrokes + the subsequent
+        # place details call into one billing session
+        if session_token:
+            params['sessiontoken'] = session_token
         
         response = requests.get(url, params=params, timeout=10)
         data = response.json()
@@ -183,8 +194,11 @@ def places_autocomplete():
 
 @app.route('/api/places/details/<place_id>')
 def place_details(place_id):
-    """Get place details including coordinates"""
+    """Get place details including coordinates.
+    Accepts session_token to close an autocomplete billing session.
+    """
     api_key = os.getenv('GOOGLE_MAPS_API_KEY')
+    session_token = request.args.get('session_token', '')
     
     if not api_key:
         return jsonify({'error': 'GOOGLE_MAPS_API_KEY not configured'}), 500
@@ -196,6 +210,10 @@ def place_details(place_id):
             'key': api_key,
             'fields': 'geometry,name,formatted_address'
         }
+        
+        # Include session token to close the autocomplete billing session
+        if session_token:
+            params['sessiontoken'] = session_token
         
         response = requests.get(url, params=params, timeout=10)
         data = response.json()
@@ -618,10 +636,10 @@ def run_scraper(job_id: str, query: str, city: str, custom_bounds: str,
     )
     
     tile_grid = TileGrid(tile_size=effective_tile_size)
-    tiles = tile_grid.create_grid(config, overlap=0.25)  # 25% overlap for maximum coverage
+    tiles = tile_grid.create_grid(config, overlap=0.10)  # 10% overlap (was 25% - reduced to cut redundant API calls)
     job.tiles_total = len(tiles)
     
-    socketio.emit('log_message', {'job_id': job_id, 'message': f'Search area: {area_degrees:.2f} sq degrees, Tile size: {effective_tile_size:.3f}°, Tiles: {len(tiles)}, Overlap: 25%', 'level': 'info'})
+    socketio.emit('log_message', {'job_id': job_id, 'message': f'Search area: {area_degrees:.2f} sq degrees, Tile size: {effective_tile_size:.3f}°, Tiles: {len(tiles)}, Overlap: 10%', 'level': 'info'})
     
     # Emit job started
     socketio.emit('job_started', job.to_dict())
@@ -790,6 +808,8 @@ async def scrape_worker(job_id: str, job: ScrapingJob, tiles: list, query: str,
             
             queries_to_try = search_queries if smart_mode else [query]
             
+            # Track which tiles found results for smart expansion
+            productive_tile_ids: Set[str] = set()            
             # Main scraping loop with radius expansion
             while expansion_count <= max_expansions:
                 if expansion_count > 0:
@@ -798,12 +818,17 @@ async def scrape_worker(job_id: str, job: ScrapingJob, tiles: list, query: str,
                         'message': f'⚡ Radius expansion #{expansion_count}: {api_radius_multiplier:.1f}x API radius ({job.current_count}/{job.target_count} found)', 
                         'level': 'warning'
                     })
-                    # Reset all tiles to unsearched so we can search them again with larger radius
+                    # Only re-search tiles that previously found results
+                    # (instead of resetting ALL tiles, which wastes API calls)
+                    tiles_to_retry = 0
                     for tile in tiles:
-                        tile.searched = False
-                        tile.business_count = 0
+                        if tile.id in productive_tile_ids:
+                            tile.searched = False
+                            tile.business_count = 0
+                            tiles_to_retry += 1
                     empty_tile_count = 0
-                    job.tiles_completed = 0
+                    job.tiles_completed = job.tiles_total - tiles_to_retry
+                    socketio.emit('log_message', {'job_id': job_id, 'message': f'Re-searching {tiles_to_retry} productive tiles (skipping {len(tiles) - tiles_to_retry} empty tiles)', 'level': 'info'})
                 
                 for i, tile in enumerate(tiles):
                     if job_manager.should_stop(job_id):
@@ -814,6 +839,10 @@ async def scrape_worker(job_id: str, job: ScrapingJob, tiles: list, query: str,
                     if job.current_count >= job.target_count:
                         socketio.emit('log_message', {'job_id': job_id, 'message': f'Target reached: {job.target_count}', 'level': 'success'})
                         break
+                    
+                    # Skip already-searched tiles (important for radius expansion)
+                    if tile.searched:
+                        continue
                     
                     socketio.emit('log_message', {'job_id': job_id, 'message': f'Searching tile {i+1}/{len(tiles)} (center: {tile.center[0]:.4f},{tile.center[1]:.4f})...', 'level': 'debug'})
                     
@@ -843,7 +872,7 @@ async def scrape_worker(job_id: str, job: ScrapingJob, tiles: list, query: str,
                                     if not business.address:
                                         business.address = f"Near {business.latitude:.4f}, {business.longitude:.4f}"
                                     
-                                    if smart_mode and (not business.phone or not business.website):
+                                    if smart_mode and not business.website:
                                         try:
                                             await scraper.get_business_details(business)
                                         except Exception as e:
@@ -899,6 +928,7 @@ async def scrape_worker(job_id: str, job: ScrapingJob, tiles: list, query: str,
                             break
                     else:
                         empty_tile_count = 0
+                        productive_tile_ids.add(tile.id)
                     
                     tile_grid.mark_tile_searched(tile.id, job.current_count)
                     job.tiles_completed += 1
@@ -923,6 +953,12 @@ async def scrape_worker(job_id: str, job: ScrapingJob, tiles: list, query: str,
                 # Save current state before expansion
                 socketio.emit('log_message', {'job_id': job_id, 'message': f'Expanding search: {job.current_count}/{job.target_count} found. Increasing API radius to {api_radius_multiplier:.1f}x...', 'level': 'info'})
                 
+            # Emit API usage stats
+            socketio.emit('log_message', {
+                'job_id': job_id,
+                'message': f'📊 {scraper.usage.summary()}',
+                'level': 'info'
+            })
     except Exception as e:
         import traceback
         print(f"[Job {job_id}] Scraper error: {e}")
