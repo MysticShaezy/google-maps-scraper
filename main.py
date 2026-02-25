@@ -137,6 +137,9 @@ class GoogleMapsScraperApp:
                             print(f"Error processing tile {tile.id}: {e}")
                         
                         pbar.update(1)
+                
+                # Print API usage stats
+                print(f"\n📊 {scraper.usage.summary()}")
     
     async def enrich_existing(self):
         """Enrich emails for existing businesses without emails"""

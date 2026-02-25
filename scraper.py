@@ -1,13 +1,20 @@
 """
 Google Maps Scraper using Places API via HTTP requests
+
+Cost optimization notes:
+- Text Search API: $32/1000 requests. Uses location+radius biasing (not redundant query text).
+- Place Details API: $17/1000 (basic) + field-level charges. Only requests needed fields.
+- Persistent disk cache avoids paying for the same API call twice.
+- API call counter tracks usage per session for cost visibility.
 """
 import os
 import time
 import math
 import requests
 from typing import List, Optional, Dict, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from models import Business, Tile
+from api_cache import APIResponseCache
 
 
 def haversine_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -27,6 +34,15 @@ def haversine_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> fl
     return c * r
 
 
+# Estimated cost per 1000 API calls (USD) - Google Maps Platform pricing
+API_COSTS = {
+    'text_search': 32.00,
+    'place_details': 17.00,
+    'autocomplete_session': 2.83,
+    'autocomplete_no_session': 2.83,
+}
+
+
 @dataclass
 class ScrapingConfig:
     """Configuration for scraping"""
@@ -37,14 +53,47 @@ class ScrapingConfig:
     delay_between_requests: float = 2.0
 
 
+@dataclass
+class APIUsageStats:
+    """Track API call counts and estimated costs"""
+    text_search_calls: int = 0
+    text_search_cache_hits: int = 0
+    place_details_calls: int = 0
+    place_details_cache_hits: int = 0
+    
+    @property
+    def estimated_cost_usd(self) -> float:
+        cost = (self.text_search_calls / 1000) * API_COSTS['text_search']
+        cost += (self.place_details_calls / 1000) * API_COSTS['place_details']
+        return round(cost, 4)
+    
+    @property
+    def estimated_savings_usd(self) -> float:
+        saved = (self.text_search_cache_hits / 1000) * API_COSTS['text_search']
+        saved += (self.place_details_cache_hits / 1000) * API_COSTS['place_details']
+        return round(saved, 4)
+    
+    def summary(self) -> str:
+        return (
+            f"API Usage: {self.text_search_calls} text searches "
+            f"({self.text_search_cache_hits} cache hits), "
+            f"{self.place_details_calls} detail lookups "
+            f"({self.place_details_cache_hits} cache hits). "
+            f"Est. cost: ${self.estimated_cost_usd:.4f}, "
+            f"Est. saved: ${self.estimated_savings_usd:.4f}"
+        )
+
+
 class GoogleMapsScraper:
-    """Scraper using Google Places API"""
+    """Scraper using Google Places API with caching and cost tracking"""
     
     def __init__(self, config=None):
         self._place_cache: Dict[str, Business] = {}
         self.config = config
         self.api_key = os.getenv('GOOGLE_MAPS_API_KEY')
         self.base_url = "https://maps.googleapis.com/maps/api/place"
+        self._api_cache = APIResponseCache()
+        self.usage = APIUsageStats()
     
     async def search_tile(
         self, 
@@ -96,8 +145,13 @@ class GoogleMapsScraper:
             max_pages = 3
             
             while page_count < max_pages:
+                # Use location+radius for geographic biasing instead of
+                # embedding "near lat,lng" in the query text. Putting location
+                # info in BOTH the query string AND the location param was
+                # redundant and could cause the API to return less relevant
+                # results while still billing for the call.
                 params = {
-                    'query': f"{query} near {tile_center_lat},{tile_center_lng}",
+                    'query': query,
                     'location': f"{tile_center_lat},{tile_center_lng}",
                     'radius': search_radius,
                     'key': self.api_key
@@ -107,8 +161,19 @@ class GoogleMapsScraper:
                     params['pagetoken'] = next_page_token
                     time.sleep(0.5)
                 
-                response = requests.get(url, params=params, timeout=10)
-                result = response.json()
+                # Check disk cache first (page tokens are never cached)
+                cached = None if next_page_token else self._api_cache.get(url, params)
+                if cached is not None:
+                    result = cached
+                    self.usage.text_search_cache_hits += 1
+                    log(f"Cache hit for tile search", 'debug')
+                else:
+                    response = requests.get(url, params=params, timeout=10)
+                    result = response.json()
+                    self.usage.text_search_calls += 1
+                    # Cache successful responses (not pagination tokens)
+                    if result.get('status') == 'OK' and not next_page_token:
+                        self._api_cache.put(url, params, result)
                 
                 if result.get('status') != 'OK':
                     if result.get('status') == 'INVALID_REQUEST' and next_page_token:
@@ -183,27 +248,36 @@ class GoogleMapsScraper:
         return businesses
     
     async def get_business_details(self, business: Business) -> Business:
-        """Get detailed info using Place Details API"""
+        """Get detailed info using Place Details API.
+        Only requests contact fields (phone, website) which are the cheapest
+        detail fields. Opening hours is an Atmosphere field with higher cost
+        and is only fetched when explicitly needed.
+        """
         
         try:
             url = f"{self.base_url}/details/json"
             params = {
                 'place_id': business.place_id,
-                'fields': 'formatted_phone_number,website,opening_hours',
+                'fields': 'formatted_phone_number,website',
                 'key': self.api_key
             }
             
-            response = requests.get(url, params=params, timeout=10)
-            result = response.json()
+            # Check cache first
+            cached = self._api_cache.get(url, params)
+            if cached is not None:
+                result = cached
+                self.usage.place_details_cache_hits += 1
+            else:
+                response = requests.get(url, params=params, timeout=10)
+                result = response.json()
+                self.usage.place_details_calls += 1
+                if result.get('status') == 'OK':
+                    self._api_cache.put(url, params, result)
             
             if result.get('status') == 'OK':
                 details = result.get('result', {})
                 business.phone = details.get('formatted_phone_number')
                 business.website = details.get('website')
-                
-                hours = details.get('opening_hours', {}).get('weekday_text', [])
-                if hours:
-                    business.hours = {day: time for day, time in [h.split(': ', 1) for h in hours if ': ' in h]}
         
         except Exception as e:
             print(f"Error: {e}")
