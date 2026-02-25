@@ -375,7 +375,7 @@ def delete_document(doc_id):
 
 @socketio.on('save_document')
 def handle_save_document(data):
-    """Save job results as a named document to Supabase"""
+    """Save job results as a named document - fallback to local storage if Supabase fails"""
     job_id = data.get('job_id')
     document_name = data.get('document_name', f'Scrape_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
     
@@ -384,39 +384,82 @@ def handle_save_document(data):
         emit('document_saved', {'error': 'No results to save'})
         return
     
-    if not supabase:
-        emit('document_saved', {'error': 'Supabase not configured'})
-        return
+    # Try Supabase first, fallback to local file
+    save_success = False
+    save_method = None
     
-    try:
-        # Read the CSV file content
-        csv_path = f"output/job_{job_id}/results.csv"
-        csv_content = ""
-        if os.path.exists(csv_path):
-            with open(csv_path, 'r', encoding='utf-8') as f:
-                csv_content = f.read()
-        
-        # Save to Supabase
-        doc_data = {
-            'job_id': job_id,
-            'document_name': document_name,
-            'query': job.query,
-            'city': data.get('city', ''),
-            'total_results': len(job.businesses),
-            'businesses': job.businesses,
-            'csv_content': csv_content
-        }
-        
-        response = supabase.table('saved_documents').insert(doc_data).execute()
-        
-        emit('document_saved', {
-            'success': True,
-            'document': response.data[0] if response.data else None,
-            'message': f'Document "{document_name}" saved with {len(job.businesses)} results'
-        })
-        
-    except Exception as e:
-        emit('document_saved', {'error': str(e)})
+    if supabase:
+        try:
+            # Read the CSV file content
+            csv_path = f"output/job_{job_id}/results.csv"
+            csv_content = ""
+            if os.path.exists(csv_path):
+                with open(csv_path, 'r', encoding='utf-8') as f:
+                    csv_content = f.read()
+            
+            # Save to Supabase
+            doc_data = {
+                'job_id': job_id,
+                'document_name': document_name,
+                'query': job.query,
+                'city': data.get('city', ''),
+                'total_results': len(job.businesses),
+                'businesses': job.businesses,
+                'csv_content': csv_content
+            }
+            
+            response = supabase.table('saved_documents').insert(doc_data).execute()
+            
+            if response.data:
+                save_success = True
+                save_method = 'supabase'
+                emit('document_saved', {
+                    'success': True,
+                    'document': response.data[0],
+                    'message': f'Document "{document_name}" saved to cloud with {len(job.businesses)} results'
+                })
+        except Exception as e:
+            print(f"Supabase save failed: {e}")
+            # Continue to fallback
+    
+    # Fallback: Save locally
+    if not save_success:
+        try:
+            import json
+            local_docs_dir = "saved_documents"
+            os.makedirs(local_docs_dir, exist_ok=True)
+            
+            doc_id = f"doc_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{job_id[:8]}"
+            doc_file = f"{local_docs_dir}/{doc_id}.json"
+            
+            doc_data = {
+                'id': doc_id,
+                'job_id': job_id,
+                'document_name': document_name,
+                'query': job.query,
+                'city': data.get('city', ''),
+                'total_results': len(job.businesses),
+                'businesses': job.businesses,
+                'created_at': datetime.now().isoformat()
+            }
+            
+            with open(doc_file, 'w', encoding='utf-8') as f:
+                json.dump(doc_data, f, indent=2)
+            
+            # Also save CSV copy
+            csv_path = f"output/job_{job_id}/results.csv"
+            csv_backup = f"{local_docs_dir}/{doc_id}.csv"
+            if os.path.exists(csv_path):
+                import shutil
+                shutil.copy2(csv_path, csv_backup)
+            
+            emit('document_saved', {
+                'success': True,
+                'document': doc_data,
+                'message': f'Document "{document_name}" saved locally with {len(job.businesses)} results (Supabase unavailable)'
+            })
+        except Exception as e:
+            emit('document_saved', {'error': f'Save failed: {str(e)}'})
 
 
 @socketio.on('start_scrape')
@@ -766,10 +809,9 @@ async def scrape_worker(job_id: str, job: ScrapingJob, tiles: list, query: str,
                 
                 for i, tile in enumerate(tiles):
                     if job_manager.should_stop(job_id):
-                        job.status = 'paused'
-                        socketio.emit('job_paused', job.to_dict())
-                        socketio.emit('log_message', {'job_id': job_id, 'message': 'Job stopped by user', 'level': 'warning'})
-                        return
+                        job.status = 'stopped'
+                        socketio.emit('log_message', {'job_id': job_id, 'message': 'Job stopped by user - will run email enrichment', 'level': 'warning'})
+                        break
                     
                     if job.current_count >= job.target_count:
                         socketio.emit('log_message', {'job_id': job_id, 'message': f'Target reached: {job.target_count}', 'level': 'success'})
@@ -864,6 +906,10 @@ async def scrape_worker(job_id: str, job: ScrapingJob, tiles: list, query: str,
                     job.tiles_completed += 1
                     socketio.emit('progress_update', job.to_dict())
                 
+                # Check if user stopped the job - break out of expansion loop
+                if job.status == 'stopped':
+                    break
+                
                 # Check if target met or max expansion reached
                 if job.current_count >= job.target_count:
                     break
@@ -889,12 +935,15 @@ async def scrape_worker(job_id: str, job: ScrapingJob, tiles: list, query: str,
         socketio.emit('job_error', {'job_id': job_id, 'error': str(e)})
         return
     
-    job.status = 'completed'
+    # Only mark as completed if not already stopped by user
+    if job.status != 'stopped':
+        job.status = 'completed'
     job.completed_at = datetime.now()
     
-    # Phase 2: Email enrichment - crawl each website individually after scraping
+    # Phase 2: Email enrichment - ALWAYS run if enrich_emails is true, even when stopped
     enriched_count = 0
     if enrich_emails and job.businesses:
+        socketio.emit('log_message', {'job_id': job_id, 'message': f'Running email enrichment for {len(job.businesses)} businesses...', 'level': 'info'})
         enriched_count = await run_email_enrichment(
             job_id=job_id,
             job=job,

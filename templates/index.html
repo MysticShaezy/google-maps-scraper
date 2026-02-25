@@ -246,7 +246,28 @@
 
         function initializeAutocomplete(){const searchInput=document.getElementById('city-search'),dropdown=document.getElementById('city-dropdown');searchInput.addEventListener('input',e=>{clearTimeout(debounceTimer);const query=e.target.value.trim();if(query.length<2){dropdown.classList.remove('active');return}dropdown.innerHTML='<div class="autocomplete-item">Searching...</div>';dropdown.classList.add('active');debounceTimer=setTimeout(()=>fetchPredictions(query),200)});searchInput.addEventListener('keydown',handleKeyNavigation);document.addEventListener('click',e=>{if(!e.target.closest('.autocomplete-container'))dropdown.classList.remove('active')})}
 
-        function fetchPredictions(query){fetch(`/api/places/autocomplete?q=${encodeURIComponent(query)}`).then(r=>r.json()).then(data=>{const dropdown=document.getElementById('city-dropdown');if(data.error||!data.predictions?.length){dropdown.innerHTML='<div class="autocomplete-item">No results</div>';return}predictions=data.predictions;selectedIndex=-1;dropdown.innerHTML=predictions.map((p,i)=>`<div class="autocomplete-item"data-index="${i}">${locationIcon}<div><div class="main-text">${p.main_text}</div><div class="secondary-text">${p.secondary_text}</div></div></div>`).join('');dropdown.querySelectorAll('.autocomplete-item').forEach(item=>item.addEventListener('click',()=>selectPlace(predictions[item.dataset.index])))}).catch(()=>document.getElementById('city-dropdown').innerHTML='<div class="autocomplete-item">Error</div>')}
+        function fetchPredictions(query){
+            fetch(`/api/places/autocomplete?q=${encodeURIComponent(query)}`)
+                .then(r=>{
+                    if(!r.ok) throw new Error(`HTTP ${r.status}: ${r.statusText}`);
+                    return r.json();
+                })
+                .then(data=>{
+                    const dropdown=document.getElementById('city-dropdown');
+                    if(data.error||!data.predictions?.length){
+                        dropdown.innerHTML='<div class="autocomplete-item">No results</div>';
+                        return;
+                    }
+                    predictions=data.predictions;
+                    selectedIndex=-1;
+                    dropdown.innerHTML=predictions.map((p,i)=>`<div class="autocomplete-item"data-index="${i}">${locationIcon}<div><div class="main-text">${p.main_text}</div><div class="secondary-text">${p.secondary_text}</div></div></div>`).join('');
+                    dropdown.querySelectorAll('.autocomplete-item').forEach(item=>item.addEventListener('click',()=>selectPlace(predictions[item.dataset.index])));
+                })
+                .catch(err=>{
+                    console.error('Autocomplete error:',err);
+                    document.getElementById('city-dropdown').innerHTML=`<div class="autocomplete-item">Error: ${err.message}</div>`;
+                });
+        }
 
         function handleKeyNavigation(e){const dropdown=document.getElementById('city-dropdown');if(!dropdown.classList.contains('active'))return;const items=dropdown.querySelectorAll('.autocomplete-item');switch(e.key){case'ArrowDown':e.preventDefault();selectedIndex=Math.min(selectedIndex+1,items.length-1);updateSelection(items);break;case'ArrowUp':e.preventDefault();selectedIndex=Math.max(selectedIndex-1,-1);updateSelection(items);break;case'Enter':e.preventDefault();if(selectedIndex>=0&&predictions[selectedIndex])selectPlace(predictions[selectedIndex]);break;case'Escape':dropdown.classList.remove('active')}}
 
