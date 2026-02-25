@@ -7,6 +7,7 @@ import asyncio
 import json
 import math
 import os
+import shutil
 import threading
 import uuid
 from datetime import datetime
@@ -412,7 +413,6 @@ def handle_save_document(data):
             
             if response.data:
                 save_success = True
-                save_method = 'supabase'
                 emit('document_saved', {
                     'success': True,
                     'document': response.data[0],
@@ -425,7 +425,6 @@ def handle_save_document(data):
     # Fallback: Save locally
     if not save_success:
         try:
-            import json
             local_docs_dir = "saved_documents"
             os.makedirs(local_docs_dir, exist_ok=True)
             
@@ -450,7 +449,6 @@ def handle_save_document(data):
             csv_path = f"output/job_{job_id}/results.csv"
             csv_backup = f"{local_docs_dir}/{doc_id}.csv"
             if os.path.exists(csv_path):
-                import shutil
                 shutil.copy2(csv_path, csv_backup)
             
             emit('document_saved', {
@@ -938,7 +936,7 @@ async def scrape_worker(job_id: str, job: ScrapingJob, tiles: list, query: str,
     # Only mark as completed if not already stopped by user
     if job.status != 'stopped':
         job.status = 'completed'
-    job.completed_at = datetime.now()
+        job.completed_at = datetime.now()
     
     # Phase 2: Email enrichment - ALWAYS run if enrich_emails is true, even when stopped
     enriched_count = 0
